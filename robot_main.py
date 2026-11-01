@@ -1,5 +1,21 @@
 # Robot main.py
-# Merges lane_following.py + station.py (ESP-NOW) + Morse Code Buzzer on top of motor.py and veml6040.py.
+# Merges lane_following.py + station.py (ESP-NOW) on top of motor.py and veml6040.py.
+#
+# States (cycled with the "next" button):
+#   black -> white       : sample the line and the background (press "sample" a few times each)
+#   red -> green -> blue : sample each color ON THE LINE, at running height
+#   ready                : MANUAL drive from the hub joystick; colors are still reported
+#   follow               : AUTONOMOUS, follows the BLACK line only
+#   (next from follow goes back to ready)
+#
+# While following:
+#   - on black / white (and the edge between them) it steers to hold the black line edge
+#   - on anything else (a red/green/blue patch, or any reading that is not black or white)
+#     it drives STRAIGHT until it is back on black / white
+#   - confirmed red/green/blue patches are still reported to the hub
+#   - the surface it is on is printed every loop
+#   - when a red/green/blue patch is confirmed, the buzzer on pin 23 sounds the color name
+#     in Morse code (a different pitch per color) in the background, without pausing driving
 
 import network, espnow, json, math
 import uasyncio as asyncio
@@ -10,12 +26,12 @@ import veml6040
 
 try:
     from motor import Motor
-except ImportError:         # file may be saved as Motor.py
+except ImportError:          # file may be saved as Motor.py
     from Motor import Motor
 
 # ================= config =================
 # --- ESP-NOW ---
-HUB_MAC = b'\xff\xff\xff\xff\xff\xff'    # broadcast; replace with the hub's MAC later
+HUB_MAC = b'\xff\xff\xff\xff\xff\xff'   # broadcast; replace with the hub's MAC later
 JOY_TIMEOUT_MS = 500                     # no joystick packet for this long -> stop (manual mode)
 
 # --- states / LEDs ---
@@ -35,7 +51,7 @@ W_TOL = 0.25              # brightness: how far outside a class's expected w ran
 W_TIE = 0.05              # classes this close in brightness are "tied"; RGB picks between them
 HOLD_DIST = 0.12          # while on a color, stay on it while its RGB is this close
 STARTUP_MS = 1000         # after entering ready/follow, ignore colors this long (follow black only)
-DEBOUNCE_MS = 200
+DEBOUNCE_MS = 500
 
 # --- "is this black / white?" ---
 NEUTRAL_DIST = 0.08       # max RGB distance from the black-to-white range to count as black/white;
@@ -56,6 +72,17 @@ I_MAX = 1
 PRINT_EVERY = 1           # print the surface every N loops (1 = every loop, 5 = about 5 per second)
 MAX_SENSOR_ERRORS = 5     # failed sensor reads in a row before the motors stop and the sensor is reset
 
+# --- Morse code on the passive buzzer ---
+BUZZER_PIN = 23
+BUZZER_DUTY = 32768       # 50% duty (duty_u16 scale 0-65535)
+MORSE_DOT_MS = 120        # one dot; everything else is a multiple of this
+MORSE_PITCH = {"red": 400, "green": 700, "blue": 1000}   # Hz, one pitch per color
+MORSE_DASH_MS = MORSE_DOT_MS * 3
+MORSE_ELEMENT_GAP_MS = MORSE_DOT_MS        # silence between dots/dashes in a letter
+MORSE_LETTER_GAP_MS = MORSE_DOT_MS * 3     # silence between letters (includes the element gap)
+MORSE = {"R": ".-.", "E": ".", "D": "-..", "B": "-...", "L": ".-..",
+         "U": "..-", "G": "--.", "N": "-."}
+
 # --- manual joystick drive (raw 16-bit values from the hub) ---
 JOY_CENTER = 30000       # stick at rest (hub gesture thresholds are 20000 / 40000)
 JOY_SPAN = 30000         # distance from center to full deflection
@@ -64,13 +91,6 @@ JOY_PRESS = 65000        # x at max = joystick button, ignore it for driving
 JOY_X_SIGN = 1           # flip to -1 if steering is reversed
 JOY_Y_SIGN = 1           # flip to -1 if forward/back is reversed
 MANUAL_MAX = 60          # max motor percent in manual mode
-
-# --- Buzzer & Morse Code Frequencies ---
-COLOR_FREQS = {"red": 400, "green": 700, "blue": 1000}
-DOT_DURATION = 120
-DASH_DURATION = DOT_DURATION * 3
-ELEMENT_GAP = DOT_DURATION
-LETTER_GAP = DOT_DURATION * 3
 
 # ================= ESP-NOW setup =================
 sta = network.WLAN(network.STA_IF)
@@ -82,7 +102,7 @@ e.add_peer(HUB_MAC)
 
 # latest joystick state from the hub
 joy = {"x": JOY_CENTER, "y": JOY_CENTER}
-last_rx = None            # ticks_ms of the last joystick packet
+last_rx = None           # ticks_ms of the last joystick packet
 
 # ================= state =================
 state = "black"
@@ -109,6 +129,10 @@ half_span = 1
 integral = 0
 prev_err = None
 turn = 0
+
+# Morse output
+morse_pending = None     # color waiting to be sounded
+morse_busy = False       # True while the buzzer task is sounding a word
 
 
 # ================= buttons =================
@@ -196,6 +220,18 @@ def neutral_dist(v):
 
 
 def classify_color(v, w, hold=None):
+    """Brightness decides which class this is; RGB only confirms it.
+
+    1. Each class (black, white, red, green, blue) has an expected brightness range:
+       from its sampled w up to where the sensor reads when sitting on that class's
+       edge with white. The brightness error is how far w falls outside that range.
+    2. The class with the smallest error wins (it must be within W_TOL).
+    3. RGB is the confirmation: a color is only accepted if its RGB is within
+       MAX_DIST of its samples. RGB picks between classes only if their brightness
+       is tied (within W_TIE).
+    4. Once on a color (hold), it is kept while its RGB still matches, because
+       the edge reading shifts toward white.
+    """
     if hold and samples[hold] and chroma_dist(v, hold) < HOLD_DIST:
         return hold
 
@@ -249,6 +285,7 @@ def detect(v, w):
 
 
 def detect_settled(v, w):
+    """Like detect(), but reports no colors during the startup window."""
     global streak, last_color
     if settling():
         streak, last_color = 0, None
@@ -272,6 +309,7 @@ def report(color, v):
 
 # ================= calibration results =================
 def set_target():
+    """Aim the edge follower at the middle of the black/white edge."""
     global target, half_span, prev_err
     target = black_w + EDGE_POS * (white_w - black_w)
     half_span = (white_w - black_w) / 2
@@ -279,6 +317,7 @@ def set_target():
 
 
 def compute_targets():
+    """Derive black/white levels from the samples. Returns False if not usable."""
     global black_w, white_w, black_c, white_c
     if not samples["black"] or not samples["white"]:
         return False
@@ -292,7 +331,7 @@ def compute_targets():
     white_c = tuple(mean([s[0][i] for s in samples["white"]]) for i in range(3))
 
     class_w.clear()
-    for c in STATES[:5]:
+    for c in STATES[:5]:                      # black, white, red, green, blue
         if samples[c]:
             class_w[c] = mean([s[1] for s in samples[c]])
     print("brightness (w):", {c: int(x) for c, x in class_w.items()})
@@ -308,15 +347,14 @@ def reset_color_tracking():
 
 
 def track_color(color, confirmed, v):
-    """Report a newly confirmed color to the hub once, play Morse code, 
-    and remember that we are on it until it has been missing for LOST_READS reads."""
+    """Report a newly confirmed color to the hub once, and remember that we are on it
+    until it has been missing for LOST_READS reads."""
     global current_color, lost
     if confirmed and color != current_color:
         current_color = color
         lost = 0
         report(color, v)
-        if color in COLOR_FREQS:
-            asyncio.create_task(play_morse_word_async(color, COLOR_FREQS[color]))
+        say(color)
     elif current_color:
         if color == current_color:
             lost = 0
@@ -324,6 +362,27 @@ def track_color(color, confirmed, v):
             lost += 1
             if lost >= LOST_READS:
                 current_color = None
+
+
+# ================= morse code =================
+def say(color):
+    """Ask the buzzer task to sound a color name in Morse. Ignored while a word is
+    already sounding, so colors passed in the meantime are reported but not spoken."""
+    global morse_pending
+    if not morse_busy and morse_pending is None:
+        morse_pending = color
+
+
+async def play_morse_word(word, freq):
+    """Sound a word as Morse tones. Uses await (not sleep) so the robot keeps driving."""
+    for letter in word.upper():
+        for element in MORSE[letter]:
+            buzzer.freq(freq)
+            buzzer.duty_u16(BUZZER_DUTY)
+            await asyncio.sleep_ms(MORSE_DASH_MS if element == "-" else MORSE_DOT_MS)
+            buzzer.duty_u16(0)
+            await asyncio.sleep_ms(MORSE_ELEMENT_GAP_MS)
+        await asyncio.sleep_ms(MORSE_LETTER_GAP_MS - MORSE_ELEMENT_GAP_MS)
 
 
 # ================= motors =================
@@ -353,6 +412,7 @@ def stop():
 
 
 def set_motor(m, speed):
+    """speed -100..100; negative = reverse."""
     speed = max(-MANUAL_MAX, min(MANUAL_MAX, int(speed)))
     if speed == 0:
         m.stop()
@@ -363,6 +423,7 @@ def set_motor(m, speed):
 
 
 def axis(raw):
+    """Raw ADC value -> -100..100 with a deadzone around center."""
     d = raw - JOY_CENTER
     if abs(d) < JOY_DEADZONE:
         return 0
@@ -372,11 +433,12 @@ def axis(raw):
 
 
 def manual_drive():
+    # failsafe: no recent packets from the hub -> stop
     if last_rx is None or time.ticks_diff(time.ticks_ms(), last_rx) > JOY_TIMEOUT_MS:
         stop()
         return
     x = joy["x"]
-    if x >= JOY_PRESS:
+    if x >= JOY_PRESS:            # button press, not a steering input
         x = JOY_CENTER
     fwd = JOY_Y_SIGN * axis(joy["y"])
     steer = JOY_X_SIGN * axis(x)
@@ -384,69 +446,28 @@ def manual_drive():
     set_motor(right, fwd - steer)
 
 
-# ================= asynchronous buzzer / morse code =================
-async def play_signal_async(duration_ms, frequency):
-    buzzer.freq(frequency)
-    buzzer.duty(512)  # 50% duty cycle
-    await asyncio.sleep_ms(duration_ms)
-    buzzer.duty(0)    # Turn off sound
-    await asyncio.sleep_ms(ELEMENT_GAP)
-
-
-async def play_morse_word_async(word, frequency):
-    """Asynchronously decodes a word text string and transmits it via Morse code tones."""
-    for letter in word.upper():
-        if letter == 'R':  # • — •
-            await play_signal_async(DOT_DURATION, frequency)
-            await play_signal_async(DASH_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-        elif letter == 'E': # •
-            await play_signal_async(DOT_DURATION, frequency)
-        elif letter == 'D': # — • •
-            await play_signal_async(DASH_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-        elif letter == 'B': # — • • •
-            await play_signal_async(DASH_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-        elif letter == 'L': # • — • •
-            await play_signal_async(DOT_DURATION, frequency)
-            await play_signal_async(DASH_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-        elif letter == 'G': # — — •
-            await play_signal_async(DASH_DURATION, frequency)
-            await play_signal_async(DASH_DURATION, frequency)
-            await play_signal_async(DOT_DURATION, frequency)
-        
-        await asyncio.sleep_ms(LETTER_GAP - ELEMENT_GAP)
-    buzzer.duty(0)
-
-
 # ================= hardware =================
-i2c = I2C(0, sda=Pin(21), scl=Pin(22), freq=100000)
+i2c = I2C(0, sda=Pin(21), scl=Pin(22), freq=100000)   # 100 kHz is more forgiving than 400 kHz
 print("I2C devices:", i2c.scan())
-sensor = veml6040.VEML6040(i2c)
+sensor = veml6040.VEML6040(i2c)       # driver starts in auto (continuous) mode
 sensor.set_integration_time(veml6040.IT_40MS)
 
 left = Motor(12, 13, 32, 39)
 right = Motor(14, 27, 33, 36)
 lights = neopixel.NeoPixel(Pin(15), 2)
+buzzer = PWM(Pin(BUZZER_PIN), freq=1000, duty_u16=0)   # silent until a color is sounded
 
 btn_next = Pin(34, Pin.IN)
 btn_sample = Pin(35, Pin.IN)
 btn_next.irq(trigger=Pin.IRQ_FALLING, handler=press)
 btn_sample.irq(trigger=Pin.IRQ_FALLING, handler=press)
 
-# Passive buzzer on Pin 23
-buzzer = PWM(Pin(23, Pin.OUT), freq=1000, duty=0)
-
 
 # ================= tasks =================
 def on_answer(ans):
+    """Called when the hub sends a confirmed 'yes' / 'no' gesture."""
     print("Hub answer:", ans)
+    # TODO: decide what the robot should do with it
 
 
 async def receive_task():
@@ -464,6 +485,23 @@ async def receive_task():
                     on_answer(d["a"])
             except (ValueError, KeyError):
                 print("bad packet:", raw)
+        await asyncio.sleep_ms(20)
+
+
+async def morse_task():
+    """Sounds one color word at a time, in the background."""
+    global morse_pending, morse_busy
+    while True:
+        if morse_pending:
+            color = morse_pending
+            morse_pending = None
+            morse_busy = True
+            print("morse:", color)
+            try:
+                await play_morse_word(color, MORSE_PITCH[color])
+            finally:
+                buzzer.duty_u16(0)          # never leave the buzzer on
+                morse_busy = False
         await asyncio.sleep_ms(20)
 
 
@@ -504,6 +542,7 @@ async def control_task():
                       [round(x, 3) for x in v_s], "w:", int(w_s))
 
         elif state == "ready":
+            # manual drive; still report colors driven over
             v, w = read()
             color, confirmed = detect_settled(v, w)
             track_color(color, confirmed, v)
@@ -511,21 +550,23 @@ async def control_task():
 
         elif state == "follow":
             v, w = read()
-            if sensor_errors >= MAX_SENSOR_ERRORS:
+            if sensor_errors >= MAX_SENSOR_ERRORS:       # sensor not answering: don't drive blind
                 stop()
                 await asyncio.sleep_ms(100)
                 continue
             color, confirmed = detect_settled(v, w)
             track_color(color, confirmed, v)
 
+            # what is under the sensor?
             on_color = color or current_color
             if on_color:
-                surface = on_color
+                surface = on_color                       # red / green / blue
             elif (not settling()
                   and w > black_w + DARK_FRAC * (white_w - black_w)
                   and neutral_dist(v) > NEUTRAL_DIST):
-                surface = "other"
+                surface = "other"                        # neither black nor white
             else:
+                # black / white / the edge between them: follow it
                 surface = "white" if w > black_w + WHITE_FRAC * (white_w - black_w) else "black"
 
             if surface in ("black", "white"):
@@ -533,8 +574,8 @@ async def control_task():
                 drive(BASE + turn, BASE - turn)
                 action = "turn %d" % int(turn)
             else:
-                reset_pid()
-                drive(BASE, BASE)
+                reset_pid()                              # clean restart when black returns
+                drive(BASE, BASE)                        # straight until back on black
                 action = "straight"
 
             loops += 1
@@ -547,12 +588,12 @@ async def control_task():
 
 async def main():
     asyncio.create_task(receive_task())
+    asyncio.create_task(morse_task())
     await control_task()
 
 
 try:
     asyncio.run(main())
 finally:
-    stop()
-    buzzer.deinit()
-    print("Program stopped.")
+    stop()      # make sure the motors are off if the program is interrupted
+    buzzer.duty_u16(0)
