@@ -21,17 +21,15 @@ LED = {"black": (3, 3, 3), "white": (40, 40, 40), "red": (40, 0, 0), "green": (0
 READS = 5
 NEUTRAL_CUT = 0.025
 COLOR_MAX = 0.05
-PATCH_CUT = 0.012
-PATCH_MS = 250
-EDGE_POS = 0.15
+EDGE_POS = 0.3
 CONFIRM = 1
 COOLDOWN_MS = 4000
 DEBOUNCE_MS = 200
 
 BASE = 25
-L_FWD = 0
-R_FWD = 1
-KP = 45
+L_FWD = 1
+R_FWD = 0
+KP = 35
 KI = 0
 KD = 7
 DT = 0.04
@@ -43,7 +41,6 @@ last_press = 0
 last_color = None
 streak = 0
 cooldown_until = 0
-patch_until = 0
 integral = 0
 prev_err = None
 turn = 0
@@ -87,6 +84,12 @@ def chroma(r, g, b):
     return (r / s, g / s, b / s)
 
 
+def median(xs):
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
 def calibrate():
     global B_C, W_C, BLACK_W, WHITE_W, COLOR_C
     rows = {l: [d for d in data if d[4] == l] for l in ("black", "white") + COLORS}
@@ -97,10 +100,10 @@ def calibrate():
 
     def avg_c(l):
         cs = [chroma(d[0], d[1], d[2]) for d in rows[l]]
-        return [sum(c[i] for c in cs) / len(cs) for i in range(3)]
+        return [median([c[i] for c in cs]) for i in range(3)]
 
     def avg_w(l):
-        return sum(d[3] for d in rows[l]) / len(rows[l])
+        return median([d[3] for d in rows[l]])
 
     B_C, W_C = avg_c("black"), avg_c("white")
     BLACK_W, WHITE_W = avg_w("black"), avg_w("white")
@@ -220,7 +223,7 @@ try:
             stop()
             buzzer.stop()
             reset_pid()
-            streak, last_color, patch_until, lit = 0, None, 0, None
+            streak, last_color, lit = 0, None, None
             if state == "follow":
                 state = "ready"
             elif state == "ready":
@@ -270,18 +273,10 @@ try:
             if streak >= CONFIRM:
                 maneuver(color, r, g, b)
                 streak = 0
-                reset_pid()
                 cooldown_until = time.ticks_add(time.ticks_ms(), COOLDOWN_MS)
-                patch_until = time.ticks_add(time.ticks_ms(), PATCH_MS)
-            else:
-                if nd > PATCH_CUT:
-                    patch_until = time.ticks_add(now, PATCH_MS)
-                if time.ticks_diff(now, patch_until) < 0:
-                    reset_pid()
-                    drive(BASE, BASE)
-                else:
-                    turn = pid(wn)
-                    drive(BASE + turn, BASE - turn)
+
+            turn = pid(wn)
+            drive(BASE + turn, BASE - turn)
 
             print(label, "%.2f" % wn, "%.3f" % nd, int(turn))
 
